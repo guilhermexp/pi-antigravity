@@ -23,7 +23,7 @@ import {
   createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 // =============================================================================
 // OAuth & Endpoint Constants
@@ -55,6 +55,8 @@ const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const CLOUD_CODE_ASSIST_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 const CLOUD_CODE_SANDBOX_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 const CLAUDE_THINKING_BETA_HEADER = "interleaved-thinking-2025-05-14";
+/** Cloud Code Assist control-plane metadata identifying the client as Antigravity. */
+const ANTIGRAVITY_LOAD_METADATA = Object.freeze({ ideType: "ANTIGRAVITY" });
 
 // =============================================================================
 // Dynamic User-Agent Discovery
@@ -114,7 +116,7 @@ async function onboardUser(accessToken: string, onProgress?: (msg: string) => vo
     headers,
     body: JSON.stringify({
       tierId: "free-tier",
-      metadata: { ideType: "ANTIGRAVITY" },
+      metadata: ANTIGRAVITY_LOAD_METADATA,
     }),
   });
 
@@ -160,7 +162,7 @@ async function discoverProject(
   const res = await fetch(`${CLOUD_CODE_ASSIST_ENDPOINT}/v1internal:loadCodeAssist`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
+    body: JSON.stringify({ metadata: ANTIGRAVITY_LOAD_METADATA }),
   });
 
   if (!res.ok) {
@@ -183,7 +185,7 @@ async function discoverProject(
   const refreshRes = await fetch(`${CLOUD_CODE_ASSIST_ENDPOINT}/v1internal:loadCodeAssist`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
+    body: JSON.stringify({ metadata: ANTIGRAVITY_LOAD_METADATA }),
   });
 
   if (refreshRes.ok) {
@@ -1598,6 +1600,247 @@ function toModelConfig(model: {
   };
 }
 
+// =============================================================================
+// Quota Reporting (/antigravity-usage)
+// =============================================================================
+
+/**
+ * One quota bucket as the backend reports it.
+ *
+ * `remainingFraction` is a proto3 float, so the JSON transport OMITS it when it
+ * is 0 — an absent field means "nothing left", not "unknown". Treating absent
+ * as full would report an exhausted account as healthy.
+ */
+interface QuotaBucket {
+  group: string;
+  usedPercent: number;
+  resetAt?: number;
+  windowLabel?: string;
+}
+
+interface AccountQuota {
+  email: string;
+  active: boolean;
+  tier?: string;
+  buckets: QuotaBucket[];
+  error?: string;
+}
+
+/** Antigravity bills Anthropic and OpenAI against one shared counter. */
+function quotaGroupFor(modelProvider: string | undefined): string | undefined {
+  switch (modelProvider) {
+    case "MODEL_PROVIDER_GOOGLE":
+      return "Gemini";
+    case "MODEL_PROVIDER_ANTHROPIC":
+    case "MODEL_PROVIDER_OPENAI":
+      return "Claude/GPT";
+    default:
+      return undefined;
+  }
+}
+
+function parseResetTime(value: unknown): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+async function fetchAccountQuota(account: SavedAccount, activeEmail: string | undefined): Promise<AccountQuota> {
+  const result: AccountQuota = { email: account.email, active: account.email === activeEmail, buckets: [] };
+
+  let token = account.access;
+  if (!token || account.expires <= Date.now()) {
+    try {
+      const refreshed = await refreshAntigravityToken({
+        refresh: account.refresh,
+        access: account.access,
+        expires: account.expires,
+        projectId: account.projectId,
+      } as OAuthCredentials);
+      token = refreshed.access;
+      // Persist so the next call does not pay for another refresh.
+      const accounts = loadSavedAccounts();
+      const idx = accounts.findIndex((a) => a.email === account.email);
+      if (idx >= 0) {
+        accounts[idx] = {
+          ...accounts[idx],
+          access: refreshed.access,
+          refresh: refreshed.refresh || accounts[idx].refresh,
+          expires: refreshed.expires,
+        };
+        saveAccounts(accounts);
+      }
+    } catch (err) {
+      result.error = `refresh falhou: ${err instanceof Error ? err.message : String(err)}`;
+      return result;
+    }
+  }
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    "User-Agent": getAntigravityUserAgent(),
+  };
+
+  try {
+    const res = await fetch(`${CLOUD_CODE_ASSIST_ENDPOINT}/v1internal:fetchAvailableModels`, {
+      method: "POST",
+      headers,
+      // The project is required here: without it the response carries no quota.
+      body: JSON.stringify({ project: account.projectId }),
+    });
+    if (!res.ok) {
+      result.error = `HTTP ${res.status}`;
+      return result;
+    }
+
+    const payload = (await res.json()) as {
+      models?: Record<string, Record<string, unknown>>;
+    };
+
+    // Collapse per-model quotas: every SKU of a provider reports the same
+    // counter, so dedupe by group + reset + fraction.
+    const seen = new Map<string, QuotaBucket>();
+    for (const [id, meta] of Object.entries(payload.models ?? {})) {
+      if (meta.isInternal === true || /^tab_|^chat_/.test(id)) continue;
+      const group = quotaGroupFor(typeof meta.modelProvider === "string" ? meta.modelProvider : undefined);
+      if (!group) continue;
+
+      const raw = meta.quotaInfo;
+      const infos = Array.isArray(raw) ? raw : raw ? [raw] : [];
+      for (const info of infos as Record<string, unknown>[]) {
+        const remaining = typeof info.remainingFraction === "number" ? info.remainingFraction : 0;
+        const resetAt = parseResetTime(info.resetTime);
+        const windowLabel =
+          typeof info.windowLabel === "string"
+            ? info.windowLabel
+            : typeof info.windowId === "string"
+              ? info.windowId
+              : undefined;
+        const bucket: QuotaBucket = {
+          group,
+          usedPercent: Math.round((1 - remaining) * 100),
+          resetAt,
+          windowLabel,
+        };
+        seen.set(`${group}|${resetAt ?? ""}|${bucket.usedPercent}|${windowLabel ?? ""}`, bucket);
+      }
+    }
+    result.buckets = [...seen.values()].sort(
+      (a, b) => a.group.localeCompare(b.group) || (a.resetAt ?? 0) - (b.resetAt ?? 0),
+    );
+  } catch (err) {
+    result.error = err instanceof Error ? err.message : String(err);
+    return result;
+  }
+
+  try {
+    const res = await fetch(`${CLOUD_CODE_ASSIST_ENDPOINT}/v1internal:loadCodeAssist`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ metadata: ANTIGRAVITY_LOAD_METADATA }),
+    });
+    if (res.ok) {
+      const tierPayload = (await res.json()) as {
+        currentTier?: { name?: string };
+        paidTier?: { name?: string };
+      };
+      // `paidTier` is an object describing the subscription the account holds
+      // (e.g. "Google AI Pro"); `currentTier` is the Code Assist tier and reads
+      // "Antigravity" even on paid plans, which is useless as a badge.
+      const paidName = tierPayload.paidTier?.name;
+      result.tier = paidName ? paidName.replace(/^Google AI\s+/, "") : tierPayload.currentTier?.name;
+    }
+  } catch {
+    // Tier is decoration; quota already succeeded.
+  }
+
+  return result;
+}
+
+/** "6d19h", "4h43m", "12m" — matches the Antigravity Hub countdown format. */
+function formatCountdown(resetAt: number | undefined, nowMs: number): string {
+  if (resetAt === undefined) return "—";
+  const remaining = resetAt - nowMs;
+  if (remaining <= 0) return "agora";
+  const totalMinutes = Math.floor(remaining / 60_000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d${hours}h`;
+  if (hours > 0) return `${hours}h${String(minutes).padStart(2, "0")}m`;
+  return `${minutes}m`;
+}
+
+const QUOTA_BAR_WIDTH = 22;
+
+function quotaBar(usedPercent: number): string {
+  const filled = Math.min(QUOTA_BAR_WIDTH, Math.round((usedPercent / 100) * QUOTA_BAR_WIDTH));
+  // A nonzero quota always shows at least one cell, so "in use" never reads as untouched.
+  const cells = usedPercent > 0 ? Math.max(1, filled) : 0;
+  return "\u2501".repeat(cells) + "\u2500".repeat(QUOTA_BAR_WIDTH - cells);
+}
+
+/** Green under 60%, amber to 89%, red at 90%+ — the Hub's thresholds. */
+function quotaColorFor(usedPercent: number): string {
+  if (usedPercent >= 90) return "error";
+  if (usedPercent >= 60) return "warning";
+  return "success";
+}
+
+interface UsageEntryData {
+  fetchedAt: number;
+  accounts: AccountQuota[];
+}
+
+/**
+ * Renders the quota report.
+ *
+ * Layout mirrors the Antigravity Hub widget: one block per account, the active
+ * one marked, then one bar per quota counter. Deliberately NOT labeled
+ * "Session"/"Weekly": `fetchAvailableModels` returns a single unlabeled counter
+ * per provider (the binding one) and never says which window it is — inferring
+ * from the reset distance mislabels accounts (verified: a weekly counter
+ * resetting in 9h would read as daily). The countdown is shown instead.
+ */
+function renderUsageEntry(data: UsageEntryData, theme: { fg: (color: string, text: string) => string; bold: (text: string) => string }): string[] {
+  const lines: string[] = [];
+  const now = data.fetchedAt;
+
+  for (const account of data.accounts) {
+    const marker = account.active ? theme.fg("success", "\u25cf") : theme.fg("dim", "\u25cb");
+    const name = account.active ? theme.bold(account.email) : account.email;
+    const tier = account.tier ? theme.fg("dim", ` ${account.tier}`) : "";
+    const activeTag = account.active ? theme.fg("success", " (ativa)") : "";
+    lines.push(`${marker} ${name}${tier}${activeTag}`);
+
+    if (account.error) {
+      lines.push(`    ${theme.fg("error", account.error)}`);
+      lines.push("");
+      continue;
+    }
+    if (account.buckets.length === 0) {
+      lines.push(`    ${theme.fg("dim", "sem cotas reportadas")}`);
+      lines.push("");
+      continue;
+    }
+
+    const labelWidth = Math.max(...account.buckets.map((b) => (b.windowLabel ? `${b.group} ${b.windowLabel}` : b.group).length));
+    for (const bucket of account.buckets) {
+      const label = bucket.windowLabel ? `${bucket.group} ${bucket.windowLabel}` : bucket.group;
+      const color = quotaColorFor(bucket.usedPercent);
+      const percent = `${bucket.usedPercent}%`.padStart(4);
+      lines.push(
+        `    ${label.padEnd(labelWidth)}  ${theme.fg(color, quotaBar(bucket.usedPercent))}  ${theme.fg(color, percent)}  ${theme.fg("dim", `reset ${formatCountdown(bucket.resetAt, now)}`)}`,
+      );
+    }
+    lines.push("");
+  }
+
+  if (lines.at(-1) === "") lines.pop();
+  return lines;
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerProvider("google-antigravity", {
     baseUrl: CLOUD_CODE_ASSIST_ENDPOINT,
@@ -1725,6 +1968,42 @@ export default function (pi: ExtensionAPI) {
         refreshActiveAccountEmail();
         ctx.ui.notify(`Conta ativa alterada para: ${selected.email}`, "info");
       }
+    },
+  });
+
+  // Quota report. The entry is durable (survives restarts) and never reaches
+  // the LLM, so a stale report stays readable in scrollback.
+  pi.registerEntryRenderer<UsageEntryData>("antigravity-usage", (entry, _options, theme) => {
+    const data = entry.data;
+    if (!data) return new Text(theme.fg("dim", "sem dados de cota"), 0, 0);
+
+    const header = `${theme.fg("accent", "Antigravity")} ${theme.fg("dim", `cotas \u00b7 ${new Date(data.fetchedAt).toLocaleTimeString()}`)}`;
+    return new Text([header, "", ...renderUsageEntry(data, theme)].join("\n"), 0, 0);
+  });
+
+  pi.registerCommand("antigravity-usage", {
+    description: "Mostrar limites de uso atualizados de todas as contas do Antigravity",
+    handler: async (_args, ctx) => {
+      let accounts = loadSavedAccounts();
+      if (accounts.length === 0) accounts = syncFromOmp();
+      if (accounts.length === 0) {
+        ctx.ui.notify("Nenhuma conta do Antigravity encontrada. Use /login para autenticar.", "warning");
+        return;
+      }
+
+      await ensureAntigravityVersion();
+      const activeEmail = getActiveAccountEmail();
+      // One request per account, in parallel: the report is useless partial.
+      const report = await Promise.all(accounts.map((account) => fetchAccountQuota(account, activeEmail)));
+      const data: UsageEntryData = { fetchedAt: Date.now(), accounts: report };
+
+      if (!ctx.hasUI) {
+        const plain = { fg: (_c: string, text: string) => text, bold: (text: string) => text };
+        process.stdout.write(`${renderUsageEntry(data, plain).join("\n")}\n`);
+        return;
+      }
+
+      pi.appendEntry<UsageEntryData>("antigravity-usage", data);
     },
   });
 
