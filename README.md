@@ -59,6 +59,37 @@ A extensão suporta múltiplas contas Google simultaneamente:
 
 ---
 
+## 📊 Relatório de Cotas — `/antigravity-usage`
+
+Mostra os limites atualizados de **todas** as contas do pool, com a ativa marcada:
+
+```text
+○ conta-a@gmail.com Pro
+    Claude/GPT  ━─────────────────────    5%  reset 15m
+    Gemini      ━━━━━━━━━━━━━━━━━━━━━━  100%  reset 8h57m
+
+● conta-b@gmail.com Pro (ativa)
+    Claude/GPT  ──────────────────────    0%  reset 4h56m
+    Gemini      ━─────────────────────    1%  reset 4h35m
+```
+
+Uma requisição por conta, em paralelo. Tokens expirados são renovados e regravados no `antigravity-accounts.json`. Funciona também fora da TUI (`pi -p "/antigravity-usage"`), sem cor.
+
+O resultado é um `appendEntry` — fica no scrollback, persiste na sessão e **não** entra no contexto do LLM.
+
+### Duas coisas que o payload obriga a respeitar
+
+**1. `remainingFraction` ausente significa cota zerada, não desconhecida.** É um `float` proto3, e o transporte JSON omite o valor default. Tratar ausente como cheio reportaria uma conta esgotada como saudável — exatamente o caso das contas em `100%` acima, onde o campo não vem.
+
+**2. Não há rótulo `Session` / `Weekly`.** O widget do Antigravity Hub separa as duas janelas, mas `fetchAvailableModels` devolve **um** contador por provider — o vinculante — sem dizer qual janela é. Inferir pela distância do reset erra: uma conta com contador semanal resetando em `8h57m` seria classificada como diária. Por isso a saída mostra a contagem regressiva e omite o rótulo. Se o backend passar a mandar `windowId`/`windowLabel` (o código já aceita array de `quotaInfo`), o rótulo aparece sozinho.
+
+`Claude/GPT` é uma linha só porque Anthropic e OpenAI compartilham o mesmo contador no Antigravity — os dois `modelProvider` sempre reportam fração e reset idênticos.
+
+O badge de plano vem de `paidTier.name` (`Google AI Pro` → `Pro`); `currentTier.name` diz `Antigravity` mesmo em conta paga.
+
+---
+
+
 ## 📌 E-mail no Footer
 
 O e-mail da conta ativa é renderizado diretamente na barra de status inferior do `pi`:
