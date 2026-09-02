@@ -862,8 +862,10 @@ function streamAntigravity(
               response = res;
               usedAccount = candidate;
               candidateSuccess = true;
-              // Set as active account in auth.json for next turns
+              // Set as active account in auth.json for next turns and reflect
+              // the (possibly rotated) account in the footer immediately.
               setActiveAccount(candidate);
+              reportActiveAccount(candidate.email);
               accountCooldowns.delete(candidate.email);
               break;
             } else {
@@ -1135,18 +1137,46 @@ function getActiveAccountEmail(): string | undefined {
   return accounts[0]?.email;
 }
 
-function updateAccountFooter(ctx: { ui: { setStatus: (key: string, text?: string) => void; theme: any; hasUI: boolean }; model?: any }): void {
-  if (!ctx.ui.hasUI) return;
-  const provider = ctx.model?.provider || "google-antigravity";
-  if (provider === "google-antigravity") {
-    const email = getActiveAccountEmail();
-    if (email) {
-      const theme = ctx.ui.theme;
-      ctx.ui.setStatus("antigravity-account", theme.fg("dim", `[${email}]`));
-      return;
-    }
+/**
+ * Footer status wiring. `streamAntigravity` runs without an ExtensionContext,
+ * so the session ctx is captured once and reused whenever account rotation
+ * changes the active credential mid-turn.
+ */
+type FooterCtx = {
+  hasUI: boolean;
+  ui: { setStatus: (key: string, text?: string) => void; theme: { fg: (color: string, text: string) => string } };
+  model?: { provider?: string };
+};
+
+let footerCtx: FooterCtx | undefined;
+let footerRenderedEmail: string | undefined;
+
+function renderAccountFooter(email: string | undefined): void {
+  const ctx = footerCtx;
+  if (!ctx?.hasUI) return;
+  if (!email) {
+    footerRenderedEmail = undefined;
+    ctx.ui.setStatus("antigravity-account", undefined);
+    return;
   }
-  ctx.ui.setStatus("antigravity-account", undefined);
+  footerRenderedEmail = email;
+  ctx.ui.setStatus("antigravity-account", ctx.ui.theme.fg("dim", email));
+}
+
+function updateAccountFooter(ctx?: FooterCtx): void {
+  if (ctx) footerCtx = ctx;
+  const provider = footerCtx?.model?.provider;
+  if (provider && provider !== "google-antigravity") {
+    renderAccountFooter(undefined);
+    return;
+  }
+  renderAccountFooter(getActiveAccountEmail());
+}
+
+/** Called from the stream after a request succeeds on `email`. */
+function reportActiveAccount(email: string): void {
+  if (email === footerRenderedEmail) return;
+  renderAccountFooter(email);
 }
 
 function syncAllAccounts(): SavedAccount[] {
@@ -1366,12 +1396,17 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // Show active account in footer on startup and model switch
+  // Show active account in footer on startup, model switch, and after each turn
+  // (rotation can change the credential mid-turn).
   pi.on("session_start", async (_event, ctx) => {
-    updateAccountFooter(ctx);
+    updateAccountFooter(ctx as unknown as FooterCtx);
   });
 
   pi.on("model_select", async (_event, ctx) => {
-    updateAccountFooter(ctx);
+    updateAccountFooter(ctx as unknown as FooterCtx);
+  });
+
+  pi.on("turn_end", async (_event, ctx) => {
+    updateAccountFooter(ctx as unknown as FooterCtx);
   });
 }
