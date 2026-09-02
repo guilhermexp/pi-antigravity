@@ -24,16 +24,6 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import {
-  createBashToolDefinition,
-  createEditToolDefinition,
-  createFindToolDefinition,
-  createGrepToolDefinition,
-  createLsToolDefinition,
-  createReadToolDefinition,
-  createWriteToolDefinition,
-} from "@earendil-works/pi-coding-agent";
-import { boxTool } from "./chrome.ts";
 
 // =============================================================================
 // OAuth & Endpoint Constants
@@ -1571,35 +1561,11 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // Re-skin the built-in tools with omp-style bordered cards.
-  //
-  // Registered here (not in the factory) because every definition needs the
-  // session cwd. `boxTool` keeps the native `execute` and the native renderers,
-  // wrapping only their output, so diff/highlight/streaming behavior is pi's.
-  let toolsInstalled = false;
-
   // Install the custom footer so the active account renders next to the model.
   // Re-installed on every session_start because session replacement rebuilds
   // the ctx the renderer reads from.
   pi.on("session_start", async (_event, ctx) => {
     refreshActiveAccountEmail();
-
-    if (!toolsInstalled) {
-      toolsInstalled = true;
-      const cwd = ctx.cwd;
-      for (const definition of [
-        createBashToolDefinition(cwd),
-        createEditToolDefinition(cwd),
-        createReadToolDefinition(cwd),
-        createWriteToolDefinition(cwd),
-        createGrepToolDefinition(cwd),
-        createFindToolDefinition(cwd),
-        createLsToolDefinition(cwd),
-      ]) {
-        pi.registerTool(boxTool(definition as any) as any);
-      }
-    }
-
     if (!ctx.hasUI) return;
     ctx.ui.setFooter(createAccountFooter(ctx as unknown as FooterRenderCtx));
   });
