@@ -643,7 +643,7 @@ function convertMessages(context: Context): any[] {
 }
 
 // =============================================================================
-// Wire Model Profiles
+// Model Discovery & Wire Profiles
 // =============================================================================
 
 interface WireModelProfile {
@@ -652,7 +652,13 @@ interface WireModelProfile {
   maxOutputTokens: number;
 }
 
+/**
+ * Static fallback used when discovery has not run (offline start, cache-only
+ * init) or when the backend drops an id. `wireId` differs from the logical id
+ * because Antigravity ships effort tiers as separate SKUs.
+ */
 const WIRE_MODEL_PROFILES: Record<string, WireModelProfile> = {
+  "gemini-3.8-flash": { wireId: "gemini-3.8-flash-medium", modelEnum: "MODEL_PLACEHOLDER_M20", maxOutputTokens: 65536 },
   "gemini-3.7-flash": { wireId: "gemini-3.7-flash-low", modelEnum: "MODEL_PLACEHOLDER_M20", maxOutputTokens: 65536 },
   "gemini-3.6-flash": { wireId: "gemini-3.6-flash-low", modelEnum: "MODEL_PLACEHOLDER_M20", maxOutputTokens: 65536 },
   "gemini-3.5-flash": { wireId: "gemini-3.5-flash-low", modelEnum: "MODEL_PLACEHOLDER_M20", maxOutputTokens: 65536 },
@@ -665,6 +671,140 @@ const WIRE_MODEL_PROFILES: Record<string, WireModelProfile> = {
   "claude-opus-4-5": { wireId: "claude-opus-4-5", maxOutputTokens: 64000 },
   "gpt-oss-120b": { wireId: "gpt-oss-120b-medium", maxOutputTokens: 8192 },
 };
+
+/**
+ * Profiles learned from `fetchAvailableModels`. Populated by `refreshModels`
+ * and consulted first, so a new backend model (e.g. gemini-3.8) works without
+ * editing this file.
+ */
+const discoveredProfiles: Record<string, WireModelProfile> = {};
+
+function resolveWireProfile(modelId: string): WireModelProfile {
+  return (
+    discoveredProfiles[modelId] ??
+    WIRE_MODEL_PROFILES[modelId] ?? {
+      wireId: modelId,
+      maxOutputTokens: modelId.startsWith("claude") ? 64000 : 65536,
+    }
+  );
+}
+
+/**
+ * Ids the backend advertises but that are not usable chat models: editor
+ * autocomplete probes, image endpoints, and stale aliases whose `displayName`
+ * contradicts their id (several `gemini-2.5-*` rows report "Gemini 3.1 Flash
+ * Lite").
+ */
+const DISCOVERY_DENYLIST = /^(tab_|chat_)|flash-lite|flash-image|^gemini-2\.5-/;
+
+/** Effort tier suffixes Antigravity ships as separate SKUs. */
+const TIER_SUFFIXES = ["-extra-low", "-low", "-medium", "-high", "-tiered"] as const;
+
+interface DiscoveredModel {
+  id: string;
+  name: string;
+  reasoning: boolean;
+  images: boolean;
+  contextWindow: number;
+  maxOutputTokens: number;
+}
+
+/**
+ * Collapse tier SKUs into one logical model per family.
+ *
+ * `gemini-3.8-flash-{low,medium,high}` becomes `gemini-3.8-flash`, routed to the
+ * middle tier when present — the same default omp uses — because exposing three
+ * near-identical entries per family makes `/model` unusable.
+ */
+function collapseTiers(models: DiscoveredModel[]): DiscoveredModel[] {
+  const families: Record<string, DiscoveredModel[]> = {};
+  const standalone: DiscoveredModel[] = [];
+
+  for (const model of models) {
+    const suffix = TIER_SUFFIXES.find((candidate) => model.id.endsWith(candidate));
+    if (!suffix) {
+      standalone.push(model);
+      continue;
+    }
+    const family = model.id.slice(0, -suffix.length);
+    (families[family] ??= []).push(model);
+  }
+
+  const collapsed: DiscoveredModel[] = [];
+  for (const [family, tiers] of Object.entries(families)) {
+    const pick =
+      tiers.find((tier) => tier.id.endsWith("-medium")) ??
+      tiers.find((tier) => tier.id.endsWith("-low")) ??
+      tiers.find((tier) => tier.id.endsWith("-high")) ??
+      tiers[0];
+    if (!pick) continue;
+
+    discoveredProfiles[family] = {
+      wireId: pick.id,
+      modelEnum: WIRE_MODEL_PROFILES[family]?.modelEnum,
+      maxOutputTokens: pick.maxOutputTokens,
+    };
+    collapsed.push({ ...pick, id: family, name: family });
+  }
+
+  for (const model of standalone) {
+    discoveredProfiles[model.id] = { wireId: model.id, maxOutputTokens: model.maxOutputTokens };
+    collapsed.push(model);
+  }
+
+  return collapsed.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/** Query `fetchAvailableModels` and return usable, tier-collapsed models. */
+async function discoverAntigravityModels(
+  accessToken: string,
+  signal?: AbortSignal,
+): Promise<DiscoveredModel[] | undefined> {
+  await ensureAntigravityVersion();
+
+  for (const endpoint of [CLOUD_CODE_ASSIST_ENDPOINT, CLOUD_CODE_SANDBOX_ENDPOINT]) {
+    try {
+      const res = await fetch(`${endpoint}/v1internal:fetchAvailableModels`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          "User-Agent": getAntigravityUserAgent(),
+        },
+        body: JSON.stringify({}),
+        signal,
+      });
+      if (!res.ok) continue;
+
+      const payload = (await res.json()) as {
+        models?: Record<string, Record<string, unknown>>;
+      };
+      const entries = Object.entries(payload.models ?? {});
+      if (entries.length === 0) continue;
+
+      const usable: DiscoveredModel[] = [];
+      for (const [id, meta] of entries) {
+        if (meta.isInternal === true || DISCOVERY_DENYLIST.test(id)) continue;
+        const contextWindow = typeof meta.maxTokens === "number" ? meta.maxTokens : 1_048_576;
+        const maxOutputTokens = typeof meta.maxOutputTokens === "number" ? meta.maxOutputTokens : 65_536;
+        usable.push({
+          id,
+          name: id,
+          reasoning: meta.supportsThinking === true,
+          images: meta.supportsImages === true,
+          contextWindow,
+          // Claude on this backend rejects >64000 regardless of what it reports.
+          maxOutputTokens: id.startsWith("claude") ? Math.min(maxOutputTokens, 64_000) : maxOutputTokens,
+        });
+      }
+      if (usable.length === 0) continue;
+      return collapseTiers(usable);
+    } catch {
+      // Try the sandbox endpoint before giving up.
+    }
+  }
+  return undefined;
+}
 
 // =============================================================================
 // Streaming Implementation
@@ -755,10 +895,7 @@ function streamAntigravity(
       }
       state.stepIndex += 1;
 
-      const profile = WIRE_MODEL_PROFILES[model.id] || {
-        wireId: model.id,
-        maxOutputTokens: model.id.startsWith("claude") ? 64000 : 65536,
-      };
+      const profile = resolveWireProfile(model.id);
       const wireModelId = profile.wireId;
       const isClaude = wireModelId.startsWith("claude");
 
@@ -1426,66 +1563,46 @@ function syncFromOmp(): SavedAccount[] {
 // Extension Entry Point
 // =============================================================================
 
+/**
+ * Offline seed catalog.
+ *
+ * Used before discovery runs and as the fallback whenever discovery cannot
+ * complete — `refreshModels` returning an empty array would otherwise wipe the
+ * provider's model list entirely.
+ */
+const SEED_MODELS = [
+  { id: "gemini-3.8-flash", reasoning: true, images: true, contextWindow: 1_048_576, maxTokens: 65_536 },
+  { id: "gemini-3.7-flash", reasoning: true, images: true, contextWindow: 1_048_576, maxTokens: 65_536 },
+  { id: "gemini-3.5-flash", reasoning: true, images: true, contextWindow: 1_048_576, maxTokens: 65_536 },
+  { id: "gemini-3.1-pro", reasoning: true, images: true, contextWindow: 1_048_576, maxTokens: 65_535 },
+  { id: "claude-sonnet-4-6", reasoning: true, images: true, contextWindow: 250_000, maxTokens: 64_000 },
+  { id: "claude-opus-4-6", reasoning: true, images: true, contextWindow: 250_000, maxTokens: 64_000 },
+  { id: "gpt-oss-120b", reasoning: true, images: false, contextWindow: 131_072, maxTokens: 32_768 },
+] as const;
+
+function toModelConfig(model: {
+  id: string;
+  reasoning: boolean;
+  images: boolean;
+  contextWindow: number;
+  maxTokens: number;
+}) {
+  return {
+    id: model.id,
+    name: model.id,
+    reasoning: model.reasoning,
+    input: model.images ? ["text", "image"] : ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: model.contextWindow,
+    maxTokens: model.maxTokens,
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerProvider("google-antigravity", {
     baseUrl: CLOUD_CODE_ASSIST_ENDPOINT,
     api: "google-antigravity" as any,
-    models: [
-      {
-        id: "gemini-3.7-flash",
-        name: "Gemini 3.7 Flash (Antigravity)",
-        reasoning: true,
-        input: ["text", "image"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 1048576,
-        maxTokens: 65536,
-      },
-      {
-        id: "gemini-3.5-flash",
-        name: "Gemini 3.5 Flash (Antigravity)",
-        reasoning: true,
-        input: ["text", "image"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 1048576,
-        maxTokens: 65536,
-      },
-      {
-        id: "gemini-3.1-pro",
-        name: "Gemini 3.1 Pro (Antigravity)",
-        reasoning: true,
-        input: ["text", "image"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 1048576,
-        maxTokens: 65536,
-      },
-      {
-        id: "claude-sonnet-4-6",
-        name: "Claude Sonnet 4.6 (Antigravity)",
-        reasoning: true,
-        input: ["text", "image"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 200000,
-        maxTokens: 64000,
-      },
-      {
-        id: "claude-opus-4-6",
-        name: "Claude Opus 4.6 (Antigravity)",
-        reasoning: true,
-        input: ["text", "image"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 200000,
-        maxTokens: 64000,
-      },
-      {
-        id: "gpt-oss-120b",
-        name: "GPT-OSS 120B (Antigravity)",
-        reasoning: true,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 131072,
-        maxTokens: 8192,
-      },
-    ],
+    models: SEED_MODELS.map(toModelConfig) as any,
     oauth: {
       name: "Antigravity (Gemini 3, Claude, GPT-OSS)",
       login: async (cb) => {
@@ -1518,6 +1635,50 @@ export default function (pi: ExtensionAPI) {
           expiresAt: cred.expires,
           projectId: cred.projectId,
         }),
+    },
+    /**
+     * Dynamic catalog: whatever the backend advertises wins, so a new family
+     * appears without editing `SEED_MODELS`.
+     *
+     * Currently DORMANT on pi 0.84.4: `createAgentSessionServices` builds the
+     * ModelRuntime without `allowModelNetwork` and every CLI caller passes
+     * `false`, so `refreshFromNetwork` (model-runtime.js:91) is never true and
+     * this callback only ever sees `allowNetwork: false`. It is kept because it
+     * costs nothing, is the documented path, and starts working the day pi
+     * enables catalog network access — until then `SEED_MODELS` is the source
+     * of truth and must be updated by hand.
+     *
+     * Every failure path returns the seed rather than `[]`, because pi treats
+     * the return value as the complete replacement list — an empty array leaves
+     * the provider with no models at all (observed).
+     */
+    refreshModels: async (context: any) => {
+      const seed = SEED_MODELS.map(toModelConfig);
+      if (!context?.allowNetwork) return seed as any;
+
+      const credential = context.credential;
+      const rawKey = typeof credential?.key === "string" ? credential.key : undefined;
+      let token = typeof credential?.access === "string" ? credential.access : undefined;
+      if (!token && rawKey?.startsWith("{")) {
+        try {
+          token = JSON.parse(rawKey).accessToken;
+        } catch {}
+      }
+      token ??= rawKey;
+      if (typeof token !== "string" || token.length === 0) return seed as any;
+
+      const discovered = await discoverAntigravityModels(token, context.signal);
+      if (!discovered || discovered.length === 0) return seed as any;
+
+      return discovered.map((model) =>
+        toModelConfig({
+          id: model.id,
+          reasoning: model.reasoning,
+          images: model.images,
+          contextWindow: model.contextWindow,
+          maxTokens: model.maxOutputTokens,
+        }),
+      ) as any;
     },
     streamSimple: streamAntigravity,
   });
