@@ -1,0 +1,26 @@
+{
+  "name": "pi-antigravity",
+  "version": "1.0.0",
+  "description": "Native Google Antigravity (Gemini 3.x, Claude, GPT-OSS) extension for pi-cli with multi-account quota rotation",
+  "type": "module",
+  "main": "index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "antigravity",
+    "google-cloud",
+    "gemini",
+    "claude"
+  ],
+  "author": "Guilherme Varela",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.80.0",
+    "@earendil-works/pi-coding-agent": ">=0.80.0"
+  }
+}
