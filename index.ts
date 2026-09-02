@@ -1302,13 +1302,6 @@ function createAccountFooter(ctx: FooterRenderCtx) {
           if (statsLeftWidth + minPadding + visibleWidth(withProvider) <= width) right = withProvider;
         }
 
-        // The whole point of this footer: the account that served the request,
-        // pinned to the model it served. Dropped first when space runs out.
-        if (ctx.model?.provider === "google-antigravity" && activeAccountEmail) {
-          const withEmail = `${activeAccountEmail} ${right}`;
-          if (statsLeftWidth + minPadding + visibleWidth(withEmail) <= width) right = withEmail;
-        }
-
         const rightWidth = visibleWidth(right);
         let statsLine: string;
         if (statsLeftWidth + minPadding + rightWidth <= width) {
@@ -1329,13 +1322,26 @@ function createAccountFooter(ctx: FooterRenderCtx) {
           theme.fg("dim", statsLeft) + theme.fg("dim", statsLine.slice(statsLeft.length)),
         ];
 
+        // Bottom line: other extensions' statuses on the left, the serving
+        // account right-aligned. Rendering it here instead of via
+        // `ctx.ui.setStatus()` is what allows the right alignment — statuses go
+        // through `getExtensionStatuses()`, which only ever left-aligns.
         const statuses: ReadonlyMap<string, string> = footerData.getExtensionStatuses();
-        if (statuses.size > 0) {
-          const line = Array.from(statuses.entries())
-            .sort(([a], [b]) => a.localeCompare(b))
-            .map(([, text]) => text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
-            .join(" ");
-          lines.push(truncateToWidth(line, width, theme.fg("dim", "...")));
+        const statusLeft = Array.from(statuses.entries())
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([, text]) => text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
+          .join(" ");
+
+        const showEmail = ctx.model?.provider === "google-antigravity" && activeAccountEmail;
+        const email = showEmail ? theme.fg("dim", activeAccountEmail as string) : "";
+        const statusLeftWidth = visibleWidth(statusLeft);
+        const emailWidth = visibleWidth(email);
+
+        if (email && statusLeftWidth + minPadding + emailWidth <= width) {
+          lines.push(statusLeft + " ".repeat(width - statusLeftWidth - emailWidth) + email);
+        } else if (statusLeft.length > 0 || email) {
+          // No room for both: statuses win, since they carry live state.
+          lines.push(truncateToWidth(statusLeft || email, width, theme.fg("dim", "...")));
         }
 
         return lines;
