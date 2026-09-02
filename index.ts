@@ -7,7 +7,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createServer } from "node:http";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { URL, URLSearchParams } from "node:url";
@@ -23,6 +23,17 @@ import {
   createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  createBashToolDefinition,
+  createEditToolDefinition,
+  createFindToolDefinition,
+  createGrepToolDefinition,
+  createLsToolDefinition,
+  createReadToolDefinition,
+  createWriteToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import { boxTool } from "./chrome.ts";
 
 // =============================================================================
 // OAuth & Endpoint Constants
@@ -1138,45 +1149,209 @@ function getActiveAccountEmail(): string | undefined {
 }
 
 /**
- * Footer status wiring. `streamAntigravity` runs without an ExtensionContext,
- * so the session ctx is captured once and reused whenever account rotation
- * changes the active credential mid-turn.
+ * Footer wiring.
+ *
+ * The active-account e-mail has to sit next to the model on the right-hand side
+ * of the stats line. `ctx.ui.setStatus()` can only append to the extension
+ * status line (left-aligned, below), so the footer is replaced with a component
+ * that mirrors pi's built-in layout (`modes/interactive/components/footer.js`)
+ * and injects the e-mail immediately before `(provider)`.
+ *
+ * `streamAntigravity` has no ExtensionContext, so the render trigger is kept at
+ * module scope: account rotation mid-turn repaints the footer right away.
  */
-type FooterCtx = {
-  hasUI: boolean;
-  ui: { setStatus: (key: string, text?: string) => void; theme: { fg: (color: string, text: string) => string } };
-  model?: { provider?: string };
-};
-
-let footerCtx: FooterCtx | undefined;
-let footerRenderedEmail: string | undefined;
-
-function renderAccountFooter(email: string | undefined): void {
-  const ctx = footerCtx;
-  if (!ctx?.hasUI) return;
-  if (!email) {
-    footerRenderedEmail = undefined;
-    ctx.ui.setStatus("antigravity-account", undefined);
-    return;
-  }
-  footerRenderedEmail = email;
-  ctx.ui.setStatus("antigravity-account", ctx.ui.theme.fg("dim", email));
-}
-
-function updateAccountFooter(ctx?: FooterCtx): void {
-  if (ctx) footerCtx = ctx;
-  const provider = footerCtx?.model?.provider;
-  if (provider && provider !== "google-antigravity") {
-    renderAccountFooter(undefined);
-    return;
-  }
-  renderAccountFooter(getActiveAccountEmail());
-}
+let activeAccountEmail: string | undefined;
+let requestFooterRender: (() => void) | undefined;
 
 /** Called from the stream after a request succeeds on `email`. */
 function reportActiveAccount(email: string): void {
-  if (email === footerRenderedEmail) return;
-  renderAccountFooter(email);
+  if (email === activeAccountEmail) return;
+  activeAccountEmail = email;
+  requestFooterRender?.();
+}
+
+function refreshActiveAccountEmail(): void {
+  const next = getActiveAccountEmail();
+  if (next === activeAccountEmail) return;
+  activeAccountEmail = next;
+  requestFooterRender?.();
+}
+
+/** Mirrors `formatTokens` from pi's built-in footer. */
+function formatTokens(count: number): string {
+  if (count < 1000) return count.toString();
+  if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
+  if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
+  if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  return `${Math.round(count / 1_000_000)}M`;
+}
+
+/** Mirrors `formatCwdForFooter` from pi's built-in footer. */
+function formatCwdForFooter(cwd: string, home: string | undefined): string {
+  if (!home) return cwd;
+  const resolvedCwd = resolve(cwd);
+  const relativeToHome = relative(resolve(home), resolvedCwd);
+  const insideHome =
+    relativeToHome === "" ||
+    (relativeToHome !== ".." && !relativeToHome.startsWith(`..${sep}`) && !isAbsolute(relativeToHome));
+  if (!insideHome) return cwd;
+  return relativeToHome === "" ? "~" : `~${sep}${relativeToHome}`;
+}
+
+interface FooterRenderCtx {
+  sessionManager: {
+    getEntries: () => Array<Record<string, any>>;
+    getCwd: () => string;
+    getSessionName: () => string | undefined;
+  };
+  model?: { id?: string; provider?: string; reasoning?: boolean; contextWindow?: number };
+  thinkingLevel?: string;
+  getContextUsage: () => { contextWindow?: number; percent?: number | null } | undefined;
+}
+
+/**
+ * Footer replacement mirroring pi's built-in three-line layout:
+ *   1. cwd (+ git branch, + session name)
+ *   2. token stats  ...  <email> (provider) model • thinking
+ *   3. extension statuses
+ *
+ * The subscription (`(sub)`) and experimental (`xp`) markers are omitted: both
+ * derive from internals not exposed to extensions. Neither applies to the
+ * Antigravity provider, which reports zero cost.
+ */
+function createAccountFooter(ctx: FooterRenderCtx) {
+  return (tui: any, theme: any, footerData: any) => {
+    const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
+    requestFooterRender = () => tui.requestRender();
+
+    return {
+      dispose() {
+        unsubscribe();
+        requestFooterRender = undefined;
+      },
+      invalidate() {},
+      render(width: number): string[] {
+        let input = 0;
+        let output = 0;
+        let cacheRead = 0;
+        let cacheWrite = 0;
+        let cost = 0;
+        let latestCacheHitRate: number | undefined;
+
+        for (const entry of ctx.sessionManager.getEntries()) {
+          const usage =
+            entry.type === "message"
+              ? entry.message?.role === "assistant" || entry.message?.role === "toolResult"
+                ? entry.message.usage
+                : undefined
+              : entry.type === "branch_summary" || entry.type === "compaction"
+                ? entry.usage
+                : undefined;
+          if (!usage) continue;
+          input += usage.input ?? 0;
+          output += usage.output ?? 0;
+          cacheRead += usage.cacheRead ?? 0;
+          cacheWrite += usage.cacheWrite ?? 0;
+          cost += usage.cost?.total ?? 0;
+          if (entry.message?.role === "assistant") {
+            const prompt = (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+            latestCacheHitRate = prompt > 0 ? ((usage.cacheRead ?? 0) / prompt) * 100 : undefined;
+          }
+        }
+
+        const contextUsage = ctx.getContextUsage();
+        const contextWindow = contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+        const percentValue = contextUsage?.percent ?? 0;
+        const percentLabel = contextUsage?.percent !== null ? percentValue.toFixed(1) : "?";
+
+        let pwd = formatCwdForFooter(ctx.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
+        const branch = footerData.getGitBranch();
+        if (branch) pwd = `${pwd} (${branch})`;
+        const sessionName = ctx.sessionManager.getSessionName();
+        if (sessionName) pwd = `${pwd} • ${sessionName}`;
+
+        const statsParts: string[] = [];
+        if (input) statsParts.push(`↑${formatTokens(input)}`);
+        if (output) statsParts.push(`↓${formatTokens(output)}`);
+        if (cacheRead) statsParts.push(`R${formatTokens(cacheRead)}`);
+        if (cacheWrite) statsParts.push(`W${formatTokens(cacheWrite)}`);
+        if ((cacheRead > 0 || cacheWrite > 0) && latestCacheHitRate !== undefined) {
+          statsParts.push(`CH${latestCacheHitRate.toFixed(1)}%`);
+        }
+        if (cost) statsParts.push(`$${cost.toFixed(3)}`);
+
+        const contextDisplay =
+          percentLabel === "?"
+            ? `?/${formatTokens(contextWindow)} (auto)`
+            : `${percentLabel}%/${formatTokens(contextWindow)} (auto)`;
+        statsParts.push(
+          percentValue > 90
+            ? theme.fg("error", contextDisplay)
+            : percentValue > 70
+              ? theme.fg("warning", contextDisplay)
+              : contextDisplay,
+        );
+
+        let statsLeft = statsParts.join(" ");
+        let statsLeftWidth = visibleWidth(statsLeft);
+        if (statsLeftWidth > width) {
+          statsLeft = truncateToWidth(statsLeft, width, "...");
+          statsLeftWidth = visibleWidth(statsLeft);
+        }
+
+        const modelName = ctx.model?.id || "no-model";
+        let right = modelName;
+        if (ctx.model?.reasoning) {
+          const level = ctx.thinkingLevel || "off";
+          right = level === "off" ? `${modelName} • thinking off` : `${modelName} • ${level}`;
+        }
+
+        const minPadding = 2;
+        if (footerData.getAvailableProviderCount() > 1 && ctx.model) {
+          const withProvider = `(${ctx.model.provider}) ${right}`;
+          if (statsLeftWidth + minPadding + visibleWidth(withProvider) <= width) right = withProvider;
+        }
+
+        // The whole point of this footer: the account that served the request,
+        // pinned to the model it served. Dropped first when space runs out.
+        if (ctx.model?.provider === "google-antigravity" && activeAccountEmail) {
+          const withEmail = `${activeAccountEmail} ${right}`;
+          if (statsLeftWidth + minPadding + visibleWidth(withEmail) <= width) right = withEmail;
+        }
+
+        const rightWidth = visibleWidth(right);
+        let statsLine: string;
+        if (statsLeftWidth + minPadding + rightWidth <= width) {
+          statsLine = statsLeft + " ".repeat(width - statsLeftWidth - rightWidth) + right;
+        } else {
+          const availableForRight = width - statsLeftWidth - minPadding;
+          if (availableForRight > 0) {
+            const truncated = truncateToWidth(right, availableForRight, "");
+            statsLine =
+              statsLeft + " ".repeat(Math.max(0, width - statsLeftWidth - visibleWidth(truncated))) + truncated;
+          } else {
+            statsLine = statsLeft;
+          }
+        }
+
+        const lines = [
+          truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "...")),
+          theme.fg("dim", statsLeft) + theme.fg("dim", statsLine.slice(statsLeft.length)),
+        ];
+
+        const statuses: ReadonlyMap<string, string> = footerData.getExtensionStatuses();
+        if (statuses.size > 0) {
+          const line = Array.from(statuses.entries())
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([, text]) => text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
+            .join(" ");
+          lines.push(truncateToWidth(line, width, theme.fg("dim", "...")));
+        }
+
+        return lines;
+      },
+    };
+  };
 }
 
 function syncAllAccounts(): SavedAccount[] {
@@ -1390,23 +1565,57 @@ export default function (pi: ExtensionAPI) {
       const selected = accounts.find((a) => a.email === selectedEmail);
       if (selected) {
         setActiveAccount(selected);
-        updateAccountFooter(ctx);
+        refreshActiveAccountEmail();
         ctx.ui.notify(`Conta ativa alterada para: ${selected.email}`, "info");
       }
     },
   });
 
-  // Show active account in footer on startup, model switch, and after each turn
-  // (rotation can change the credential mid-turn).
+  // Re-skin the built-in tools with omp-style bordered cards.
+  //
+  // Registered here (not in the factory) because every definition needs the
+  // session cwd. `boxTool` keeps the native `execute` and the native renderers,
+  // wrapping only their output, so diff/highlight/streaming behavior is pi's.
+  let toolsInstalled = false;
+
+  // Install the custom footer so the active account renders next to the model.
+  // Re-installed on every session_start because session replacement rebuilds
+  // the ctx the renderer reads from.
   pi.on("session_start", async (_event, ctx) => {
-    updateAccountFooter(ctx as unknown as FooterCtx);
+    refreshActiveAccountEmail();
+
+    if (!toolsInstalled) {
+      toolsInstalled = true;
+      const cwd = ctx.cwd;
+      for (const definition of [
+        createBashToolDefinition(cwd),
+        createEditToolDefinition(cwd),
+        createReadToolDefinition(cwd),
+        createWriteToolDefinition(cwd),
+        createGrepToolDefinition(cwd),
+        createFindToolDefinition(cwd),
+        createLsToolDefinition(cwd),
+      ]) {
+        pi.registerTool(boxTool(definition as any) as any);
+      }
+    }
+
+    if (!ctx.hasUI) return;
+    ctx.ui.setFooter(createAccountFooter(ctx as unknown as FooterRenderCtx));
   });
 
-  pi.on("model_select", async (_event, ctx) => {
-    updateAccountFooter(ctx as unknown as FooterCtx);
+  pi.on("session_shutdown", async () => {
+    requestFooterRender = undefined;
   });
 
-  pi.on("turn_end", async (_event, ctx) => {
-    updateAccountFooter(ctx as unknown as FooterCtx);
+  // Rotation repaints via reportActiveAccount; these cover manual /login and
+  // out-of-band edits to auth.json.
+  pi.on("model_select", async () => {
+    refreshActiveAccountEmail();
+    requestFooterRender?.();
+  });
+
+  pi.on("turn_end", async () => {
+    refreshActiveAccountEmail();
   });
 }
