@@ -21,6 +21,8 @@ import {
   type OAuthLoginCallbacks,
   type SimpleStreamOptions,
   createAssistantMessageEventStream,
+  getCurrentSystemPrompt,
+  getCurrentTools,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -912,6 +914,11 @@ function streamAntigravity(
 
       const contents = convertMessages(context);
 
+      // pi >= 0.86 passes a TranscriptContext: prompt and tools live in system messages.
+      const systemPrompt: string | undefined =
+        (context as any).systemPrompt ?? (getCurrentSystemPrompt(context.messages) || undefined);
+      const tools: any[] | undefined = (context as any).tools ?? getCurrentTools(context.messages);
+
       let response: Response | null = null;
       let lastErr: any = null;
       let usedAccount: SavedAccount | null = null;
@@ -953,15 +960,15 @@ function streamAntigravity(
           },
         };
 
-        if (context.systemPrompt) {
+        if (systemPrompt) {
           requestBody.request.systemInstruction = {
             role: "user",
-            parts: [{ text: context.systemPrompt }],
+            parts: [{ text: systemPrompt }],
           };
         }
 
-        if (context.tools && context.tools.length > 0) {
-          const declarations = context.tools.map((t: any) => {
+        if (tools && tools.length > 0) {
+          const declarations = tools.map((t: any) => {
             const norm = normalizeSchemaForCCA(t.parameters);
             return {
               name: t.name,
