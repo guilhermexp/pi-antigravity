@@ -26,12 +26,15 @@ pi install https://github.com/guilhermexp/pi-antigravity
 
 | Modelo | Contexto | Max Output | Raciocínio (Thinking) | Visão (Imagens) |
 | :--- | :--- | :--- | :--- | :--- |
-| **`gemini-3.7-flash`** | 1.0M | 65.5K | ✅ Sim | ✅ Sim |
+| **`gemini-3.8-flash`** | 1.0M | 65.5K | ✅ Sim (High/Unbounded) | ✅ Sim |
+| **`gemini-3.7-flash`** | 1.0M | 65.5K | ✅ Sim (High/Unbounded) | ✅ Sim |
+| **`gemini-3.6-flash`** | 1.0M | 65.5K | ✅ Sim (High/Unbounded) | ✅ Sim |
 | **`gemini-3.5-flash`** | 1.0M | 65.5K | ✅ Sim | ✅ Sim |
+| **`gemini-3.5-flash-lite`** | 1.0M | 65.5K | ✅ Sim (Dinâmico) | ✅ Sim |
 | **`gemini-3.1-pro`** | 1.0M | 65.5K | ✅ Sim | ✅ Sim |
-| **`claude-sonnet-4-6`** | 200K | 64K | ✅ Sim | ✅ Sim |
-| **`claude-opus-4-6`** | 200K | 64K | ✅ Sim | ✅ Sim |
-| **`gpt-oss-120b`** | 131K | 8.2K | ✅ Sim | ❌ Não |
+| **`claude-sonnet-4-6`** | 250K | 64K | ✅ Sim | ✅ Sim |
+| **`claude-opus-4-6`** | 250K | 64K | ✅ Sim | ✅ Sim |
+| **`gpt-oss-120b`** | 131K | 32.7K | ✅ Sim | ❌ Não |
 
 ---
 

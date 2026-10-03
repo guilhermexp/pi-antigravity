@@ -64,7 +64,8 @@ const ANTIGRAVITY_LOAD_METADATA = Object.freeze({ ideType: "ANTIGRAVITY" });
 // Dynamic User-Agent Discovery
 // =============================================================================
 
-let cachedAntigravityVersion = "2.8.0";
+let cachedAntigravityVersion = "2.19.1";
+let cachedAntigravityCl = "6046815158665216";
 
 async function ensureAntigravityVersion(): Promise<void> {
   try {
@@ -74,9 +75,13 @@ async function ensureAntigravityVersion(): Promise<void> {
     );
     if (res.ok) {
       const text = await res.text();
-      const match = text.match(/^version:\s*(.+)$/m);
-      if (match && match[1]) {
-        cachedAntigravityVersion = match[1].trim();
+      const versionMatch = text.match(/^version:\s*(.+)$/m);
+      if (versionMatch && versionMatch[1]) {
+        cachedAntigravityVersion = versionMatch[1].trim();
+      }
+      const clMatch = text.match(/url:\s*.*?[/-](\d{10,})[/-]/);
+      if (clMatch && clMatch[1]) {
+        cachedAntigravityCl = clMatch[1];
       }
     }
   } catch {
@@ -88,7 +93,7 @@ function getAntigravityUserAgent(): string {
   const version = process.env.PI_AI_ANTIGRAVITY_VERSION || cachedAntigravityVersion;
   const os = process.env.PI_AI_ANTIGRAVITY_OS || "darwin";
   const arch = process.env.PI_AI_ANTIGRAVITY_ARCH || "arm64";
-  const cl = process.env.PI_AI_ANTIGRAVITY_CL || "963137146";
+  const cl = process.env.PI_AI_ANTIGRAVITY_CL || cachedAntigravityCl;
   return `antigravity/hub/${version} (aidev_client; os_type=${os}; arch=${arch}; cl=${cl})`;
 }
 
@@ -662,18 +667,46 @@ interface WireModelProfile {
  * because Antigravity ships effort tiers as separate SKUs.
  */
 const WIRE_MODEL_PROFILES: Record<string, WireModelProfile> = {
-  "gemini-3.8-flash": { wireId: "gemini-3.8-flash-medium", modelEnum: "MODEL_PLACEHOLDER_M20", maxOutputTokens: 65536 },
-  "gemini-3.7-flash": { wireId: "gemini-3.7-flash-low", modelEnum: "MODEL_PLACEHOLDER_M20", maxOutputTokens: 65536 },
-  "gemini-3.6-flash": { wireId: "gemini-3.6-flash-low", modelEnum: "MODEL_PLACEHOLDER_M20", maxOutputTokens: 65536 },
-  "gemini-3.5-flash": { wireId: "gemini-3.5-flash-low", modelEnum: "MODEL_PLACEHOLDER_M20", maxOutputTokens: 65536 },
+  // Gemini 3.8 Flash
+  "gemini-3.8-flash": { wireId: "gemini-3.8-flash-high", modelEnum: "MODEL_PLACEHOLDER_M318", maxOutputTokens: 65536 },
+  "gemini-3.8-flash-high": { wireId: "gemini-3.8-flash-high", modelEnum: "MODEL_PLACEHOLDER_M318", maxOutputTokens: 65536 },
+  "gemini-3.8-flash-medium": { wireId: "gemini-3.8-flash-medium", modelEnum: "MODEL_PLACEHOLDER_M319", maxOutputTokens: 65536 },
+  "gemini-3.8-flash-low": { wireId: "gemini-3.8-flash-low", modelEnum: "MODEL_PLACEHOLDER_M320", maxOutputTokens: 65536 },
+
+  // Gemini 3.7 Flash
+  "gemini-3.7-flash": { wireId: "gemini-3.7-flash-high", modelEnum: "MODEL_PLACEHOLDER_M298", maxOutputTokens: 65536 },
+  "gemini-3.7-flash-high": { wireId: "gemini-3.7-flash-high", modelEnum: "MODEL_PLACEHOLDER_M298", maxOutputTokens: 65536 },
+  "gemini-3.7-flash-medium": { wireId: "gemini-3.7-flash-medium", modelEnum: "MODEL_PLACEHOLDER_M299", maxOutputTokens: 65536 },
+  "gemini-3.7-flash-low": { wireId: "gemini-3.7-flash-low", modelEnum: "MODEL_PLACEHOLDER_M300", maxOutputTokens: 65536 },
+
+  // Gemini 3.6 Flash
+  "gemini-3.6-flash": { wireId: "gemini-3.6-flash-high", modelEnum: "MODEL_PLACEHOLDER_M71", maxOutputTokens: 65536 },
+  "gemini-3.6-flash-high": { wireId: "gemini-3.6-flash-high", modelEnum: "MODEL_PLACEHOLDER_M71", maxOutputTokens: 65536 },
+  "gemini-3.6-flash-medium": { wireId: "gemini-3.6-flash-medium", modelEnum: "MODEL_PLACEHOLDER_M72", maxOutputTokens: 65536 },
+  "gemini-3.6-flash-low": { wireId: "gemini-3.6-flash-low", modelEnum: "MODEL_PLACEHOLDER_M73", maxOutputTokens: 65536 },
+
+  // Gemini 3.5 Flash & Flash Lite
+  "gemini-3.5-flash": { wireId: "gemini-3-flash-agent", modelEnum: "MODEL_PLACEHOLDER_M84", maxOutputTokens: 65536 },
+  "gemini-3.5-flash-lite": { wireId: "gemini-3.5-flash-lite", modelEnum: "MODEL_PLACEHOLDER_M198", maxOutputTokens: 65535 },
   "gemini-3-flash": { wireId: "gemini-3.5-flash-low", modelEnum: "MODEL_PLACEHOLDER_M20", maxOutputTokens: 65536 },
+
+  // Gemini 3.1 Pro
   "gemini-3.1-pro": { wireId: "gemini-pro-agent", modelEnum: "MODEL_PLACEHOLDER_M16", maxOutputTokens: 65535 },
+  "gemini-3.1-pro-high": { wireId: "gemini-pro-agent", modelEnum: "MODEL_PLACEHOLDER_M16", maxOutputTokens: 65535 },
+  "gemini-3.1-pro-low": { wireId: "gemini-3.1-pro-low", modelEnum: "MODEL_PLACEHOLDER_M36", maxOutputTokens: 65535 },
+  "gemini-pro-agent": { wireId: "gemini-pro-agent", modelEnum: "MODEL_PLACEHOLDER_M16", maxOutputTokens: 65535 },
   "gemini-3-pro": { wireId: "gemini-pro-agent", modelEnum: "MODEL_PLACEHOLDER_M16", maxOutputTokens: 65535 },
-  "claude-sonnet-4-6": { wireId: "claude-sonnet-4-6", maxOutputTokens: 64000 },
-  "claude-opus-4-6": { wireId: "claude-opus-4-6-thinking", maxOutputTokens: 64000 },
-  "claude-sonnet-4-5": { wireId: "claude-sonnet-4-5", maxOutputTokens: 64000 },
-  "claude-opus-4-5": { wireId: "claude-opus-4-5", maxOutputTokens: 64000 },
-  "gpt-oss-120b": { wireId: "gpt-oss-120b-medium", maxOutputTokens: 8192 },
+
+  // Claude
+  "claude-sonnet-4-6": { wireId: "claude-sonnet-4-6", modelEnum: "MODEL_PLACEHOLDER_M35", maxOutputTokens: 64000 },
+  "claude-opus-4-6": { wireId: "claude-opus-4-6-thinking", modelEnum: "MODEL_PLACEHOLDER_M26", maxOutputTokens: 64000 },
+  "claude-opus-4-6-thinking": { wireId: "claude-opus-4-6-thinking", modelEnum: "MODEL_PLACEHOLDER_M26", maxOutputTokens: 64000 },
+  "claude-sonnet-4-5": { wireId: "claude-sonnet-4-6", modelEnum: "MODEL_PLACEHOLDER_M35", maxOutputTokens: 64000 },
+  "claude-opus-4-5": { wireId: "claude-opus-4-6-thinking", modelEnum: "MODEL_PLACEHOLDER_M26", maxOutputTokens: 64000 },
+
+  // OpenAI
+  "gpt-oss-120b": { wireId: "gpt-oss-120b-medium", modelEnum: "MODEL_OPENAI_GPT_OSS_120B_MEDIUM", maxOutputTokens: 32768 },
+  "gpt-oss-120b-medium": { wireId: "gpt-oss-120b-medium", modelEnum: "MODEL_OPENAI_GPT_OSS_120B_MEDIUM", maxOutputTokens: 32768 },
 };
 
 /**
@@ -699,7 +732,7 @@ function resolveWireProfile(modelId: string): WireModelProfile {
  * contradicts their id (several `gemini-2.5-*` rows report "Gemini 3.1 Flash
  * Lite").
  */
-const DISCOVERY_DENYLIST = /^(tab_|chat_)|flash-lite|flash-image|^gemini-2\.5-/;
+const DISCOVERY_DENYLIST = /^(tab_|chat_)|gemini-3\.1-flash-lite|flash-image|^gemini-2\.5-/;
 
 /** Effort tier suffixes Antigravity ships as separate SKUs. */
 const TIER_SUFFIXES = ["-extra-low", "-low", "-medium", "-high", "-tiered"] as const;
@@ -717,43 +750,61 @@ interface DiscoveredModel {
  * Collapse tier SKUs into one logical model per family.
  *
  * `gemini-3.8-flash-{low,medium,high}` becomes `gemini-3.8-flash`, routed to the
- * middle tier when present — the same default omp uses — because exposing three
- * near-identical entries per family makes `/model` unusable.
+ * high tier when present (Google's default recommendation in Antigravity Hub).
  */
 function collapseTiers(models: DiscoveredModel[]): DiscoveredModel[] {
   const families: Record<string, DiscoveredModel[]> = {};
   const standalone: DiscoveredModel[] = [];
 
   for (const model of models) {
+    discoveredProfiles[model.id] = {
+      wireId: model.id,
+      modelEnum: WIRE_MODEL_PROFILES[model.id]?.modelEnum,
+      maxOutputTokens: model.maxOutputTokens,
+    };
+
     const suffix = TIER_SUFFIXES.find((candidate) => model.id.endsWith(candidate));
     if (!suffix) {
-      standalone.push(model);
+      if (model.id === "claude-opus-4-6-thinking") {
+        standalone.push({ ...model, id: "claude-opus-4-6", name: "claude-opus-4-6" });
+      } else if (model.id === "gemini-pro-agent") {
+        standalone.push({ ...model, id: "gemini-3.1-pro", name: "gemini-3.1-pro" });
+      } else {
+        standalone.push(model);
+      }
       continue;
     }
     const family = model.id.slice(0, -suffix.length);
+    if (family === "gemini-3.1-pro") continue;
     (families[family] ??= []).push(model);
   }
 
   const collapsed: DiscoveredModel[] = [];
   for (const [family, tiers] of Object.entries(families)) {
     const pick =
+      tiers.find((tier) => tier.id.endsWith("-high")) ??
       tiers.find((tier) => tier.id.endsWith("-medium")) ??
       tiers.find((tier) => tier.id.endsWith("-low")) ??
-      tiers.find((tier) => tier.id.endsWith("-high")) ??
       tiers[0];
     if (!pick) continue;
 
     discoveredProfiles[family] = {
       wireId: pick.id,
-      modelEnum: WIRE_MODEL_PROFILES[family]?.modelEnum,
+      modelEnum: WIRE_MODEL_PROFILES[family]?.modelEnum ?? WIRE_MODEL_PROFILES[pick.id]?.modelEnum,
       maxOutputTokens: pick.maxOutputTokens,
     };
     collapsed.push({ ...pick, id: family, name: family });
   }
 
   for (const model of standalone) {
-    discoveredProfiles[model.id] = { wireId: model.id, maxOutputTokens: model.maxOutputTokens };
-    collapsed.push(model);
+    discoveredProfiles[model.id] = {
+      wireId: WIRE_MODEL_PROFILES[model.id]?.wireId ?? model.id,
+      modelEnum: WIRE_MODEL_PROFILES[model.id]?.modelEnum,
+      maxOutputTokens: model.maxOutputTokens,
+    };
+    if (!collapsed.some((c) => c.id === model.id)) {
+      collapsed.push(model);
+    }
   }
 
   return collapsed.sort((a, b) => a.id.localeCompare(b.id));
@@ -1582,7 +1633,9 @@ function syncFromOmp(): SavedAccount[] {
 const SEED_MODELS = [
   { id: "gemini-3.8-flash", reasoning: true, images: true, contextWindow: 1_048_576, maxTokens: 65_536 },
   { id: "gemini-3.7-flash", reasoning: true, images: true, contextWindow: 1_048_576, maxTokens: 65_536 },
+  { id: "gemini-3.6-flash", reasoning: true, images: true, contextWindow: 1_048_576, maxTokens: 65_536 },
   { id: "gemini-3.5-flash", reasoning: true, images: true, contextWindow: 1_048_576, maxTokens: 65_536 },
+  { id: "gemini-3.5-flash-lite", reasoning: true, images: true, contextWindow: 1_048_576, maxTokens: 65_535 },
   { id: "gemini-3.1-pro", reasoning: true, images: true, contextWindow: 1_048_576, maxTokens: 65_535 },
   { id: "claude-sonnet-4-6", reasoning: true, images: true, contextWindow: 250_000, maxTokens: 64_000 },
   { id: "claude-opus-4-6", reasoning: true, images: true, contextWindow: 250_000, maxTokens: 64_000 },
