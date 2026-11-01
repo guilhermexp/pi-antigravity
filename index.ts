@@ -1737,6 +1737,7 @@ function createAccountFooter(ctx: FooterRenderCtx) {
           .sort(([a], [b]) => a.localeCompare(b))
           .map(([, text]) => text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
           .join(" ");
+        const statusLeftWidth = visibleWidth(statusLeft);
 
         const showEmail = ctx.model?.provider === "google-antigravity" && activeAccountEmail;
         let bottomRightContent = "";
@@ -2278,6 +2279,7 @@ export default function (pi: ExtensionAPI) {
           fetchGeminiQuotaForAccount(activeAccountEmail).catch(() => {});
         }
       }, 60_000);
+      quotaInterval.unref?.();
     }
 
     if (!ctx.hasUI) return;
