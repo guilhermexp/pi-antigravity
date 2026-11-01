@@ -93,13 +93,19 @@ O badge de plano vem de `paidTier.name` (`Google AI Pro` → `Pro`); `currentTie
 ---
 
 
-## 📌 E-mail no Footer
+## 📌 E-mail e Cota do Gemini no Footer
 
-O e-mail da conta ativa é renderizado diretamente na barra de status inferior do `pi`:
+O e-mail da conta ativa e a **cota em tempo real dos modelos Gemini** são renderizados de forma discreta na barra de status inferior do `pi`, com mini-barra de progresso, porcentagem utilizada e contagem regressiva de reset:
 
 ```text
 ↑3.8M ↓1.2k R3.5M CH49.4% [seu-email@gmail.com] (google-antigravity) gemini-3.7-flash • medium
+                                       seu-email@gmail.com  Gemini ━━━─────── 31% reset 3h21m
 ```
+
+- **Foco exclusivo em Gemini**: Apenas o consumo dos modelos Gemini é exibido ao lado do e-mail (sem poluir com contadores compartilhados do Claude/GPT-OSS).
+- **Responsivo**: Se a largura do terminal for reduzida, a extensão adapta a exibição dinamicamente (barra compacta → texto com porcentagem e reset → apenas porcentagem → apenas e-mail).
+- **Atualização contínua**: O contador atualiza em segundo plano a cada 60 segundos, a cada final de turno e imediatamente se houver rotação de conta (`HTTP 429`) ou troca manual (`/antigravity`).
+- **Menu `/antigravity` enriquecido**: O seletor de contas passa a listar o uso do Gemini de cada conta para facilitar a escolha.
 
 ---
 

@@ -1,6 +1,6 @@
 {
   "name": "pi-antigravity",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Native Google Antigravity (Gemini 3.x, Claude, GPT-OSS) extension for pi-cli with multi-account quota rotation",
   "type": "module",
   "main": "index.ts",

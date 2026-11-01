@@ -1335,6 +1335,209 @@ function getActiveAccountEmail(): string | undefined {
   return accounts[0]?.email;
 }
 
+// =============================================================================
+// Quota & Account Management
+// =============================================================================
+
+/**
+ * One quota bucket as the backend reports it.
+ *
+ * `remainingFraction` is a proto3 float, so the JSON transport OMITS it when it
+ * is 0 — an absent field means "nothing left", not "unknown". Treating absent
+ * as full would report an exhausted account as healthy.
+ */
+interface QuotaBucket {
+  group: string;
+  usedPercent: number;
+  resetAt?: number;
+  windowLabel?: string;
+}
+
+interface AccountQuota {
+  email: string;
+  active: boolean;
+  tier?: string;
+  buckets: QuotaBucket[];
+  error?: string;
+}
+
+interface GeminiQuota {
+  usedPercent: number;
+  resetAt?: number;
+  windowLabel?: string;
+  fetchedAt: number;
+}
+
+const geminiQuotaCache = new Map<string, GeminiQuota>();
+const inFlightQuotaFetches = new Map<string, Promise<GeminiQuota | undefined>>();
+
+/** Antigravity bills Anthropic and OpenAI against one shared counter. */
+function quotaGroupFor(modelProvider: string | undefined): string | undefined {
+  switch (modelProvider) {
+    case "MODEL_PROVIDER_GOOGLE":
+      return "Gemini";
+    case "MODEL_PROVIDER_ANTHROPIC":
+    case "MODEL_PROVIDER_OPENAI":
+      return "Claude/GPT";
+    default:
+      return undefined;
+  }
+}
+
+function parseResetTime(value: unknown): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+/** "6d19h", "4h43m", "12m" — matches the Antigravity Hub countdown format. */
+function formatCountdown(resetAt: number | undefined, nowMs: number): string {
+  if (resetAt === undefined) return "—";
+  const remaining = resetAt - nowMs;
+  if (remaining <= 0) return "agora";
+  const totalMinutes = Math.floor(remaining / 60_000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d${hours}h`;
+  if (hours > 0) return `${hours}h${String(minutes).padStart(2, "0")}m`;
+  return `${minutes}m`;
+}
+
+const QUOTA_BAR_WIDTH = 22;
+
+function miniQuotaBar(usedPercent: number, barWidth = 10): string {
+  const filled = Math.min(barWidth, Math.round((usedPercent / 100) * barWidth));
+  // A nonzero quota always shows at least one cell, so "in use" never reads as untouched.
+  const cells = usedPercent > 0 ? Math.max(1, filled) : 0;
+  return "\u2501".repeat(cells) + "\u2500".repeat(barWidth - cells);
+}
+
+function quotaBar(usedPercent: number): string {
+  return miniQuotaBar(usedPercent, QUOTA_BAR_WIDTH);
+}
+
+/** Green under 60%, amber to 89%, red at 90%+ — the Hub's thresholds. */
+function quotaColorFor(usedPercent: number): string {
+  if (usedPercent >= 90) return "error";
+  if (usedPercent >= 60) return "warning";
+  return "success";
+}
+
+async function getValidAccountToken(account: SavedAccount): Promise<string | undefined> {
+  let token = account.access;
+  if (!token || account.expires <= Date.now()) {
+    try {
+      const refreshed = await refreshAntigravityToken({
+        refresh: account.refresh,
+        access: account.access,
+        expires: account.expires,
+        projectId: account.projectId,
+      } as OAuthCredentials);
+      token = refreshed.access;
+      const accounts = loadSavedAccounts();
+      const idx = accounts.findIndex((a) => a.email === account.email);
+      if (idx >= 0) {
+        accounts[idx] = {
+          ...accounts[idx],
+          access: refreshed.access,
+          refresh: refreshed.refresh || accounts[idx].refresh,
+          expires: refreshed.expires,
+        };
+        saveAccounts(accounts);
+      }
+    } catch {
+      return undefined;
+    }
+  }
+  return token;
+}
+
+async function fetchGeminiQuotaForAccount(email: string, force = false): Promise<GeminiQuota | undefined> {
+  const cached = geminiQuotaCache.get(email);
+  const now = Date.now();
+  if (!force && cached && now - cached.fetchedAt < 60_000) {
+    return cached;
+  }
+
+  if (inFlightQuotaFetches.has(email)) {
+    return inFlightQuotaFetches.get(email);
+  }
+
+  const promise = (async () => {
+    try {
+      const accounts = loadSavedAccounts();
+      const account = accounts.find((a) => a.email === email);
+      if (!account) return undefined;
+
+      const token = await getValidAccountToken(account);
+      if (!token) return undefined;
+
+      const res = await fetch(`${CLOUD_CODE_ASSIST_ENDPOINT}/v1internal:fetchAvailableModels`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "User-Agent": getAntigravityUserAgent(),
+        },
+        body: JSON.stringify({ project: account.projectId }),
+      });
+      if (!res.ok) return undefined;
+
+      const payload = (await res.json()) as {
+        models?: Record<string, Record<string, unknown>>;
+      };
+
+      for (const [id, meta] of Object.entries(payload.models ?? {})) {
+        if (meta.isInternal === true || /^tab_|^chat_/.test(id)) continue;
+        const group = quotaGroupFor(typeof meta.modelProvider === "string" ? meta.modelProvider : undefined);
+        if (group !== "Gemini") continue;
+
+        const raw = meta.quotaInfo;
+        const infos = Array.isArray(raw) ? raw : raw ? [raw] : [];
+        for (const info of infos as Record<string, unknown>[]) {
+          const remaining = typeof info.remainingFraction === "number" ? info.remainingFraction : 0;
+          const resetAt = parseResetTime(info.resetTime);
+          const windowLabel =
+            typeof info.windowLabel === "string"
+              ? info.windowLabel
+              : typeof info.windowId === "string"
+                ? info.windowId
+                : undefined;
+          const quota: GeminiQuota = {
+            usedPercent: Math.round((1 - remaining) * 100),
+            resetAt,
+            windowLabel,
+            fetchedAt: Date.now(),
+          };
+          geminiQuotaCache.set(email, quota);
+          if (email === activeAccountEmail) {
+            requestFooterRender?.();
+          }
+          return quota;
+        }
+      }
+    } catch {
+      return undefined;
+    } finally {
+      inFlightQuotaFetches.delete(email);
+    }
+    return undefined;
+  })();
+
+  inFlightQuotaFetches.set(email, promise);
+  return promise;
+}
+
+async function prefetchAllAccountsQuota(): Promise<void> {
+  const accounts = loadSavedAccounts();
+  for (const acc of accounts) {
+    if (acc.email) {
+      await fetchGeminiQuotaForAccount(acc.email).catch(() => {});
+    }
+  }
+}
+
 /**
  * Footer wiring.
  *
@@ -1352,16 +1555,22 @@ let requestFooterRender: (() => void) | undefined;
 
 /** Called from the stream after a request succeeds on `email`. */
 function reportActiveAccount(email: string): void {
-  if (email === activeAccountEmail) return;
+  const changed = email !== activeAccountEmail;
   activeAccountEmail = email;
   requestFooterRender?.();
+  if (changed) {
+    fetchGeminiQuotaForAccount(email).catch(() => {});
+  }
 }
 
 function refreshActiveAccountEmail(): void {
   const next = getActiveAccountEmail();
-  if (next === activeAccountEmail) return;
+  const changed = next !== activeAccountEmail;
   activeAccountEmail = next;
   requestFooterRender?.();
+  if (changed && next) {
+    fetchGeminiQuotaForAccount(next).catch(() => {});
+  }
 }
 
 /** Mirrors `formatTokens` from pi's built-in footer. */
@@ -1530,15 +1739,72 @@ function createAccountFooter(ctx: FooterRenderCtx) {
           .join(" ");
 
         const showEmail = ctx.model?.provider === "google-antigravity" && activeAccountEmail;
-        const email = showEmail ? theme.fg("dim", activeAccountEmail as string) : "";
-        const statusLeftWidth = visibleWidth(statusLeft);
-        const emailWidth = visibleWidth(email);
+        let bottomRightContent = "";
+        let bottomRightWidth = 0;
 
-        if (email && statusLeftWidth + minPadding + emailWidth <= width) {
-          lines.push(statusLeft + " ".repeat(width - statusLeftWidth - emailWidth) + email);
-        } else if (statusLeft.length > 0 || email) {
+        if (showEmail) {
+          const emailStr = activeAccountEmail as string;
+          const quota = geminiQuotaCache.get(emailStr);
+
+          if (quota) {
+            const now = Date.now();
+            const color = quotaColorFor(quota.usedPercent);
+            const percentStr = `${quota.usedPercent}%`;
+            const cd = formatCountdown(quota.resetAt, now);
+            const cdStr = quota.resetAt ? `reset ${cd}` : "";
+            const cdShort = quota.resetAt ? cd : "";
+
+            // 1. Full layout: email  Gemini ━━━─────── 31% reset 3h21m
+            const bar10 = miniQuotaBar(quota.usedPercent, 10);
+            const fullPlain = `${emailStr}  Gemini ${bar10} ${percentStr}${cdStr ? " " + cdStr : ""}`;
+            const fullRendered = `${theme.fg("dim", emailStr)}  ${theme.fg("dim", "Gemini")} ${theme.fg(color, bar10)} ${theme.fg(color, percentStr)}${cdStr ? " " + theme.fg("dim", cdStr) : ""}`;
+
+            // 2. Compact bar layout: email  Gemini ━━──── 31% 3h21m
+            const bar6 = miniQuotaBar(quota.usedPercent, 6);
+            const compPlain = `${emailStr}  Gemini ${bar6} ${percentStr}${cdShort ? " " + cdShort : ""}`;
+            const compRendered = `${theme.fg("dim", emailStr)}  ${theme.fg("dim", "Gemini")} ${theme.fg(color, bar6)} ${theme.fg(color, percentStr)}${cdShort ? " " + theme.fg("dim", cdShort) : ""}`;
+
+            // 3. Text only layout: email  Gemini 31% (3h21m)
+            const textPlain = `${emailStr}  Gemini ${percentStr}${cdShort ? ` (${cdShort})` : ""}`;
+            const textRendered = `${theme.fg("dim", emailStr)}  ${theme.fg("dim", "Gemini")} ${theme.fg(color, percentStr)}${cdShort ? " " + theme.fg("dim", `(${cdShort})`) : ""}`;
+
+            // 4. Percentage only: email  Gemini 31%
+            const minPlain = `${emailStr}  Gemini ${percentStr}`;
+            const minRendered = `${theme.fg("dim", emailStr)}  ${theme.fg("dim", "Gemini")} ${theme.fg(color, percentStr)}`;
+
+            // 5. Fallback email only
+            const emailPlain = emailStr;
+            const emailRendered = theme.fg("dim", emailStr);
+
+            const available = width - statusLeftWidth - minPadding;
+            if (visibleWidth(fullPlain) <= available) {
+              bottomRightContent = fullRendered;
+              bottomRightWidth = visibleWidth(fullPlain);
+            } else if (visibleWidth(compPlain) <= available) {
+              bottomRightContent = compRendered;
+              bottomRightWidth = visibleWidth(compPlain);
+            } else if (visibleWidth(textPlain) <= available) {
+              bottomRightContent = textRendered;
+              bottomRightWidth = visibleWidth(textPlain);
+            } else if (visibleWidth(minPlain) <= available) {
+              bottomRightContent = minRendered;
+              bottomRightWidth = visibleWidth(minPlain);
+            } else {
+              bottomRightContent = emailRendered;
+              bottomRightWidth = visibleWidth(emailPlain);
+            }
+          } else {
+            fetchGeminiQuotaForAccount(emailStr).catch(() => {});
+            bottomRightContent = theme.fg("dim", emailStr);
+            bottomRightWidth = visibleWidth(emailStr);
+          }
+        }
+
+        if (bottomRightContent && statusLeftWidth + minPadding + bottomRightWidth <= width) {
+          lines.push(statusLeft + " ".repeat(width - statusLeftWidth - bottomRightWidth) + bottomRightContent);
+        } else if (statusLeft.length > 0 || bottomRightContent) {
           // No room for both: statuses win, since they carry live state.
-          lines.push(truncateToWidth(statusLeft || email, width, theme.fg("dim", "...")));
+          lines.push(truncateToWidth(statusLeft || bottomRightContent, width, theme.fg("dim", "...")));
         }
 
         return lines;
@@ -1664,76 +1930,13 @@ function toModelConfig(model: {
 // Quota Reporting (/antigravity-usage)
 // =============================================================================
 
-/**
- * One quota bucket as the backend reports it.
- *
- * `remainingFraction` is a proto3 float, so the JSON transport OMITS it when it
- * is 0 — an absent field means "nothing left", not "unknown". Treating absent
- * as full would report an exhausted account as healthy.
- */
-interface QuotaBucket {
-  group: string;
-  usedPercent: number;
-  resetAt?: number;
-  windowLabel?: string;
-}
-
-interface AccountQuota {
-  email: string;
-  active: boolean;
-  tier?: string;
-  buckets: QuotaBucket[];
-  error?: string;
-}
-
-/** Antigravity bills Anthropic and OpenAI against one shared counter. */
-function quotaGroupFor(modelProvider: string | undefined): string | undefined {
-  switch (modelProvider) {
-    case "MODEL_PROVIDER_GOOGLE":
-      return "Gemini";
-    case "MODEL_PROVIDER_ANTHROPIC":
-    case "MODEL_PROVIDER_OPENAI":
-      return "Claude/GPT";
-    default:
-      return undefined;
-  }
-}
-
-function parseResetTime(value: unknown): number | undefined {
-  if (typeof value !== "string") return undefined;
-  const ms = Date.parse(value);
-  return Number.isNaN(ms) ? undefined : ms;
-}
-
 async function fetchAccountQuota(account: SavedAccount, activeEmail: string | undefined): Promise<AccountQuota> {
   const result: AccountQuota = { email: account.email, active: account.email === activeEmail, buckets: [] };
 
-  let token = account.access;
-  if (!token || account.expires <= Date.now()) {
-    try {
-      const refreshed = await refreshAntigravityToken({
-        refresh: account.refresh,
-        access: account.access,
-        expires: account.expires,
-        projectId: account.projectId,
-      } as OAuthCredentials);
-      token = refreshed.access;
-      // Persist so the next call does not pay for another refresh.
-      const accounts = loadSavedAccounts();
-      const idx = accounts.findIndex((a) => a.email === account.email);
-      if (idx >= 0) {
-        accounts[idx] = {
-          ...accounts[idx],
-          access: refreshed.access,
-          refresh: refreshed.refresh || accounts[idx].refresh,
-          expires: refreshed.expires,
-        };
-        saveAccounts(accounts);
-      }
-    } catch (err) {
-      result.error = `refresh falhou: ${err instanceof Error ? err.message : String(err)}`;
-      return result;
-    }
+  const token = await getValidAccountToken(account);
+  if (!token) {
+    result.error = "falha ao obter token de acesso";
+    return result;
   }
 
   const headers = {
@@ -1789,6 +1992,19 @@ async function fetchAccountQuota(account: SavedAccount, activeEmail: string | un
     result.buckets = [...seen.values()].sort(
       (a, b) => a.group.localeCompare(b.group) || (a.resetAt ?? 0) - (b.resetAt ?? 0),
     );
+
+    const geminiBucket = result.buckets.find((b) => b.group === "Gemini");
+    if (geminiBucket) {
+      geminiQuotaCache.set(account.email, {
+        usedPercent: geminiBucket.usedPercent,
+        resetAt: geminiBucket.resetAt,
+        windowLabel: geminiBucket.windowLabel,
+        fetchedAt: Date.now(),
+      });
+      if (account.email === activeAccountEmail) {
+        requestFooterRender?.();
+      }
+    }
   } catch (err) {
     result.error = err instanceof Error ? err.message : String(err);
     return result;
@@ -1816,36 +2032,6 @@ async function fetchAccountQuota(account: SavedAccount, activeEmail: string | un
   }
 
   return result;
-}
-
-/** "6d19h", "4h43m", "12m" — matches the Antigravity Hub countdown format. */
-function formatCountdown(resetAt: number | undefined, nowMs: number): string {
-  if (resetAt === undefined) return "—";
-  const remaining = resetAt - nowMs;
-  if (remaining <= 0) return "agora";
-  const totalMinutes = Math.floor(remaining / 60_000);
-  const days = Math.floor(totalMinutes / 1440);
-  const hours = Math.floor((totalMinutes % 1440) / 60);
-  const minutes = totalMinutes % 60;
-  if (days > 0) return `${days}d${hours}h`;
-  if (hours > 0) return `${hours}h${String(minutes).padStart(2, "0")}m`;
-  return `${minutes}m`;
-}
-
-const QUOTA_BAR_WIDTH = 22;
-
-function quotaBar(usedPercent: number): string {
-  const filled = Math.min(QUOTA_BAR_WIDTH, Math.round((usedPercent / 100) * QUOTA_BAR_WIDTH));
-  // A nonzero quota always shows at least one cell, so "in use" never reads as untouched.
-  const cells = usedPercent > 0 ? Math.max(1, filled) : 0;
-  return "\u2501".repeat(cells) + "\u2500".repeat(QUOTA_BAR_WIDTH - cells);
-}
-
-/** Green under 60%, amber to 89%, red at 90%+ — the Hub's thresholds. */
-function quotaColorFor(usedPercent: number): string {
-  if (usedPercent >= 90) return "error";
-  if (usedPercent >= 60) return "warning";
-  return "success";
 }
 
 interface UsageEntryData {
@@ -2013,11 +2199,17 @@ export default function (pi: ExtensionAPI) {
 
       const selectedEmail = await ctx.ui.select({
         message: "Selecione a conta do Google Antigravity para ativar:",
-        options: accounts.map((acc) => ({
-          id: acc.email,
-          label: acc.email,
-          description: `Projeto: ${acc.projectId} | Expira em: ${new Date(acc.expires).toLocaleTimeString()}`,
-        })),
+        options: accounts.map((acc) => {
+          const q = geminiQuotaCache.get(acc.email);
+          const qInfo = q
+            ? ` | Gemini: ${q.usedPercent}%${q.resetAt ? ` (${formatCountdown(q.resetAt, Date.now())})` : ""}`
+            : "";
+          return {
+            id: acc.email,
+            label: acc.email,
+            description: `Projeto: ${acc.projectId}${qInfo} | Expira em: ${new Date(acc.expires).toLocaleTimeString()}`,
+          };
+        }),
       });
 
       if (!selectedEmail) return;
@@ -2026,6 +2218,7 @@ export default function (pi: ExtensionAPI) {
       if (selected) {
         setActiveAccount(selected);
         refreshActiveAccountEmail();
+        fetchGeminiQuotaForAccount(selected.email, true).catch(() => {});
         ctx.ui.notify(`Conta ativa alterada para: ${selected.email}`, "info");
       }
     },
@@ -2067,27 +2260,52 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  let quotaInterval: NodeJS.Timeout | undefined;
+
   // Install the custom footer so the active account renders next to the model.
   // Re-installed on every session_start because session replacement rebuilds
   // the ctx the renderer reads from.
   pi.on("session_start", async (_event, ctx) => {
     refreshActiveAccountEmail();
+    if (activeAccountEmail) {
+      fetchGeminiQuotaForAccount(activeAccountEmail).catch(() => {});
+      prefetchAllAccountsQuota().catch(() => {});
+    }
+
+    if (!quotaInterval) {
+      quotaInterval = setInterval(() => {
+        if (activeAccountEmail) {
+          fetchGeminiQuotaForAccount(activeAccountEmail).catch(() => {});
+        }
+      }, 60_000);
+    }
+
     if (!ctx.hasUI) return;
     ctx.ui.setFooter(createAccountFooter(ctx as unknown as FooterRenderCtx));
   });
 
   pi.on("session_shutdown", async () => {
     requestFooterRender = undefined;
+    if (quotaInterval) {
+      clearInterval(quotaInterval);
+      quotaInterval = undefined;
+    }
   });
 
   // Rotation repaints via reportActiveAccount; these cover manual /login and
   // out-of-band edits to auth.json.
   pi.on("model_select", async () => {
     refreshActiveAccountEmail();
+    if (activeAccountEmail) {
+      fetchGeminiQuotaForAccount(activeAccountEmail).catch(() => {});
+    }
     requestFooterRender?.();
   });
 
   pi.on("turn_end", async () => {
     refreshActiveAccountEmail();
+    if (activeAccountEmail) {
+      fetchGeminiQuotaForAccount(activeAccountEmail, true).catch(() => {});
+    }
   });
 }
